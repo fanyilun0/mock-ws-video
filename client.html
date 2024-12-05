@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>视频流播放器</title>
+    <style>
+        .video-container {
+            max-width: 800px;
+            margin: 20px auto;
+        }
+        video {
+            width: 100%;
+            border: 1px solid #ccc;
+        }
+        .control-panel {
+            margin: 10px 0;
+            padding: 10px;
+            background: #f5f5f5;
+        }
+        .url-input {
+            width: 80%;
+            padding: 5px;
+            margin-right: 10px;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            background: #f5f5f5;
+        }
+        .debug {
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            margin-top: 10px;
+            padding: 10px;
+            background: #eee;
+        }
+    </style>
+</head>
+<body>
+    <div class="video-container">
+        <div class="control-panel">
+            <input type="text" id="wsUrl" class="url-input" value="ws://localhost:8080/video1" placeholder="输入WebSocket URL">
+            <button onclick="connectToNewUrl()">连接</button>
+        </div>
+        <video id="videoPlayer" controls autoplay></video>
+        <div id="status" class="status">等待连接...</div>
+        <div id="debug" class="debug"></div>
+    </div>
+
+    <script>
+        const video = document.getElementById('videoPlayer');
+        const status = document.getElementById('status');
+        const debug = document.getElementById('debug');
+        const urlInput = document.getElementById('wsUrl');
+        let mediaSource;
+        let sourceBuffer;
+        let queue = [];
+        let updating = false;
+        let totalReceived = 0;
+        let currentWs = null;
+
+        function log(message) {
+            console.log(message);
+            debug.textContent += new Date().toLocaleTimeString() + ': ' + message + '\n';
+            debug.scrollTop = debug.scrollHeight;
+        }
+
+        function cleanupConnection() {
+            if (currentWs) {
+                currentWs.close();
+                currentWs = null;
+            }
+            if (sourceBuffer && mediaSource.readyState === 'open') {
+                try {
+                    sourceBuffer.abort();
+                } catch (e) {
+                    log(`清理SourceBuffer错误: ${e.message}`);
+                }
+            }
+            if (mediaSource && mediaSource.readyState === 'open') {
+                try {
+                    mediaSource.endOfStream();
+                } catch (e) {
+                    log(`清理MediaSource错误: ${e.message}`);
+                }
+            }
+            queue = [];
+            updating = false;
+            totalReceived = 0;
+            sourceBuffer = null;
+        }
+
+        function connectToNewUrl() {
+            cleanupConnection();
+            connect(urlInput.value);
+        }
+
+        function processQueue() {
+            if (!sourceBuffer || updating || queue.length === 0 || mediaSource.readyState !== 'open') {
+                return;
+            }
+            updating = true;
+            const data = queue.shift();
+            try {
+                sourceBuffer.appendBuffer(data);
+                log(`处理队列: 添加 ${data.byteLength} 字节`);
+            } catch (e) {
+                log(`追加缓冲区错误: ${e.message}`);
+                status.textContent = '追加缓冲区错误: ' + e.message;
+                updating = false;
+            }
+        }
+
+        function connect(wsUrl) {
+            log(`开始连接到 ${wsUrl}`);
+            status.textContent = '正在连接...';
+            
+            currentWs = new WebSocket(wsUrl);
+            mediaSource = new MediaSource();
+            video.src = URL.createObjectURL(mediaSource);
+
+            currentWs.onopen = () => {
+                log('WebSocket连接已建立');
+                status.textContent = 'WebSocket已连接';
+            };
+
+            mediaSource.addEventListener('sourceopen', () => {
+                log('MediaSource已打开');
+                try {
+                    const mimeCodec = 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
+                    if (!MediaSource.isTypeSupported(mimeCodec)) {
+                        throw new Error(`此浏览器不支持: ${mimeCodec}`);
+                    }
+
+                    sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
+                    sourceBuffer.mode = 'segments';
+                    sourceBuffer.addEventListener('updateend', () => {
+                        updating = false;
+                        processQueue();
+                        if (queue.length === 0 && !video.paused && video.readyState < 4) {
+                            log('尝试开始播放');
+                            video.play().catch(e => log(`播放错误: ${e.message}`));
+                        }
+                    });
+
+                    status.textContent = '已连接，准备接收视频流';
+                } catch (e) {
+                    log(`MediaSource错误: ${e.message}`);
+                    status.textContent = 'MediaSource错误: ' + e.message;
+                }
+            });
+
+            currentWs.onmessage = async (event) => {
+                try {
+                    const data = await event.data.arrayBuffer();
+                    totalReceived += data.byteLength;
+                    log(`收到数据: ${data.byteLength} 字节, 总计: ${totalReceived} 字节`);
+                    queue.push(data);
+                    if (!updating) {
+                        processQueue();
+                    }
+                } catch (e) {
+                    log(`数据处理错误: ${e.message}`);
+                    status.textContent = '数据处理错误: ' + e.message;
+                }
+            };
+
+            currentWs.onerror = (error) => {
+                log(`WebSocket错误: ${error}`);
+                status.textContent = 'WebSocket错误';
+            };
+
+            currentWs.onclose = () => {
+                log('WebSocket连接已关闭');
+                status.textContent = 'WebSocket连接已关闭';
+                if (mediaSource.readyState === 'open') {
+                    mediaSource.endOfStream();
+                }
+            };
+
+            video.addEventListener('playing', () => {
+                log('视频开始播放');
+                status.textContent = '正在播放';
+            });
+
+            video.addEventListener('waiting', () => {
+                log('视频缓冲中');
+                status.textContent = '缓冲中...';
+            });
+
+            video.addEventListener('error', (e) => {
+                log(`视频错误: ${video.error.message}`);
+                status.textContent = '视频错误: ' + video.error.message;
+            });
+
+            video.addEventListener('stalled', () => {
+                log('视频已暂停');
+                status.textContent = '视频已暂停';
+            });
+
+            video.addEventListener('canplay', () => {
+                log('视频可以播放');
+                video.play().catch(e => log(`播放错误: ${e.message}`));
+            });
+        }
+
+        // 初始连接
+        connect(urlInput.value);
+    </script>
+</body>
+</html> 
